@@ -102,8 +102,13 @@ app.post('/notify', async (req, res) => {
 
 
 // ---------- SERVER ----------
-const PORT = process.env.PORT || 3000;
+// Default route (for testing in browser)
+app.get('/', (req, res) => {
+  res.send('✅ PayU integration is running! Use /pay for payment requests.');
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 PayU integration server running on http://localhost:${PORT}`);
 });
+
 
