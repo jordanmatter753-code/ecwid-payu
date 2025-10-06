@@ -36,7 +36,9 @@ app.post('/pay', async (req, res) => {
 
     // 2. Create order in PayU
     const payuResp = await axios.post(`${PAYU_API_URL}/api/v2_1/orders`, {
-      notifyUrl: "https://YOUR_DEPLOYED_DOMAIN.com/notify", // 👈 PayU calls this
+  notifyUrl: "https://ecwid-payu.onrender.com/notify",
+  continueUrl: "https://panzlyzeczkami.pl/?payment_success=true", // 👈 redirect buyer here after success
+ // 👈 PayU calls this
       customerIp: "127.0.0.1",
       merchantPosId: PAYU_POS_ID,
       description: `Order ${orderData.cart.order.orderNumber}`,
@@ -104,3 +106,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 PayU integration server running on http://localhost:${PORT}`);
 });
+
