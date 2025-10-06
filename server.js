@@ -36,9 +36,8 @@ app.post('/pay', async (req, res) => {
 
     // 2. Create order in PayU
     const payuResp = await axios.post(`${PAYU_API_URL}/api/v2_1/orders`, {
-  notifyUrl: "https://ecwid-payu.onrender.com/notify",
-  continueUrl: "https://panzlyzeczkami.pl/?payment_success=true", // 👈 redirect buyer here after success
- // 👈 PayU calls this
+      notifyUrl: "https://ecwid-payu.onrender.com/notify",
+      continueUrl: "https://panzlyzeczkami.pl/?payment_success=true", // 👈 redirect buyer here after success
       customerIp: "127.0.0.1",
       merchantPosId: PAYU_POS_ID,
       description: `Order ${orderData.cart.order.orderNumber}`,
@@ -57,9 +56,7 @@ app.post('/pay', async (req, res) => {
     console.log("Redirect customer to:", redirectUrl);
 
     // Send Ecwid the redirect link
-    res.json({
-      redirectUrl: redirectUrl
-    });
+    res.json({ redirectUrl });
 
   } catch (err) {
     console.error("Error creating PayU order:", err.response?.data || err.message);
@@ -100,15 +97,13 @@ app.post('/notify', async (req, res) => {
   }
 });
 
-
 // ---------- SERVER ----------
 // Default route (for testing in browser)
 app.get('/', (req, res) => {
   res.send('✅ PayU integration is running! Use /pay for payment requests.');
 });
 
+const PORT = process.env.PORT || 3000; // 👈 This line was missing before!
 app.listen(PORT, () => {
   console.log(`🚀 PayU integration server running on http://localhost:${PORT}`);
 });
-
-
