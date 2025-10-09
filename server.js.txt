@@ -1,12 +1,15 @@
+// server.js - Ecwid -> PayU middleware (robust, handles form-encoded 'data' and JSON)
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 
 const app = express();
-app.use(bodyParser.json());
 
-// ✅ Load credentials from .env file
+// accept JSON and form-urlencoded bodies (Ecwid may send either)
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
 const {
   PAYU_CLIENT_ID,
   PAYU_CLIENT_SECRET,
@@ -17,81 +20,157 @@ const {
   ECWID_API_TOKEN
 } = process.env;
 
-// ---------- STEP 1: PAYMENT INITIATION FROM ECWID ----------
+// Helper: decode Ecwid payload if Ecwid sends 'data' (base64) or JSON directly
+function decodeEcwidPayload(req) {
+  // If Ecwid sent form field 'data' (base64 JSON)
+  if (req.body && req.body.data) {
+    try {
+      const buf = Buffer.from(req.body.data, 'base64');
+      return JSON.parse(buf.toString('utf8'));
+    } catch (e) {
+      console.error('Failed to parse base64 Ecwid data:', e.message);
+    }
+  }
+  // If Ecwid sent JSON directly
+  if (req.body && Object.keys(req.body).length) return req.body;
+  // Fallback to query params
+  if (req.query && Object.keys(req.query).length) return req.query;
+  return null;
+}
+
+// Simple homepage for humans
+app.get('/', (req, res) => {
+  res.send('✅ PayU integration is running. POST to /pay to start payment.');
+});
+
+// Friendly GET /pay page (so browser users don't see "Cannot GET /pay")
+app.get('/pay', (req, res) => {
+  res.send(`
+    <html>
+      <head><title>PayU Checkout</title></head>
+      <body style="font-family:Arial;margin:40px;color:#333;">
+        <img src="https://static.payu.com/images/logo.png" alt="PayU" style="width:160px"/><br/>
+        <p>Loading payment page… If you were redirected here by Ecwid, the payment should start automatically.</p>
+      </body>
+    </html>
+  `);
+});
+
+// POST /pay - Ecwid calls this to start payment
 app.post('/pay', async (req, res) => {
   try {
-    const orderData = req.body; // Ecwid will send order info here
-    console.log("Received order from Ecwid:", orderData);
+    const payload = decodeEcwidPayload(req);
+    console.log('DEBUG: Received raw Ecwid payload:', JSON.stringify(req.body, null, 2));
+    console.log('DEBUG: Decoded Ecwid payload:', JSON.stringify(payload, null, 2));
 
-    // 1. Get OAuth token from PayU
+    if (!payload || (!payload.cart && !payload.order && !payload.orderId)) {
+      console.error('Bad or empty Ecwid payload; nothing to process.');
+      return res.status(400).send('Bad request: empty Ecwid payload');
+    }
+
+    // Normalize order object depending on payload shape:
+    // Ecwid sometimes sends `cart.order` or direct `order`.
+    const order = payload.cart?.order || payload.order || payload;
+    const ecwidOrderId = order.id || order.orderNumber || order.orderId || null;
+    const returnUrl = order.returnUrl || payload.returnUrl || order.return_url || order.returnUrl || 'https://panzlyzeczkami.pl/';
+
+    // Build PayU product list & total
+    const items = (order.items || []).map(it => ({
+      name: it.name || it.sku || 'Product',
+      unitPrice: Math.round((it.price || 0) * 100).toString(),
+      quantity: it.quantity || 1
+    }));
+
+    const totalCents = Math.round((order.total || order.totalAmount || order.paymentAmount || 0) * 100).toString();
+
+    // 1) request OAuth token from PayU
     const tokenResp = await axios.post(`${PAYU_API_URL}/pl/standard/user/oauth/authorize`, null, {
       params: {
         grant_type: 'client_credentials',
         client_id: PAYU_CLIENT_ID,
         client_secret: PAYU_CLIENT_SECRET
-      }
+      },
+      // prevent axios from URL-encoding non-params accidentally
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
 
-    const accessToken = tokenResp.data.access_token;
-
-    // 2. Create order in PayU
-    const payuResp = await axios.post(`${PAYU_API_URL}/api/v2_1/orders`, {
-      notifyUrl: "https://YOUR_DEPLOYED_DOMAIN.com/notify", // 👈 PayU calls this
-      customerIp: "127.0.0.1",
-      merchantPosId: PAYU_POS_ID,
-      description: `Order ${orderData.cart.order.orderNumber}`,
-      currencyCode: orderData.cart.order.currency,
-      totalAmount: (orderData.cart.order.total * 100).toString(), // PayU expects cents
-      products: orderData.cart.order.items.map(item => ({
-        name: item.name,
-        unitPrice: (item.price * 100).toString(),
-        quantity: item.quantity
-      }))
-    }, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
-
-    const redirectUrl = payuResp.data.redirectUri;
-    console.log("Redirect customer to:", redirectUrl);
-
-    // Send Ecwid the redirect link
-    res.json({
-      redirectUrl: redirectUrl
-    });
-
-  } catch (err) {
-    console.error("Error creating PayU order:", err.response?.data || err.message);
-    res.status(500).send("Payment error");
-  }
-});
-
-// ---------- STEP 2: PAYU NOTIFICATION CALLBACK ----------
-app.post('/notify', async (req, res) => {
-  try {
-    const notification = req.body;
-    console.log("PayU Notification:", notification);
-
-    // Example: Get Ecwid Order ID back from notification
-    const ecwidOrderId = notification?.order?.extOrderId;
-
-    if (notification.order.status === "COMPLETED") {
-      // Mark order as PAID in Ecwid
-      await axios.post(`https://app.ecwid.com/api/v3/${ECWID_STORE_ID}/orders/${ecwidOrderId}/payment_status`, {
-        paymentStatus: "PAID"
-      }, {
-        headers: { Authorization: `Bearer ${ECWID_API_TOKEN}` }
-      });
+    const accessToken = tokenResp.data?.access_token;
+    if (!accessToken) {
+      console.error('PayU token missing in response:', JSON.stringify(tokenResp.data));
+      return res.status(500).send('Payment error: auth');
     }
 
-    res.send("OK"); // PayU expects "OK" back
+    // 2) create order in PayU
+    const orderBody = {
+      notifyUrl: `${process.env.PUBLIC_BASE_URL || 'https://ecwid-payu.onrender.com'}/notify`,
+      continueUrl: returnUrl,
+      customerIp: req.ip || '127.0.0.1',
+      merchantPosId: PAYU_POS_ID,
+      description: `Order ${ecwidOrderId}`,
+      currencyCode: order.currency || 'PLN',
+      totalAmount: totalCents,
+      extOrderId: ecwidOrderId ? String(ecwidOrderId) : undefined,
+      products: items
+    };
+
+    console.log('DEBUG: Creating PayU order with body:', JSON.stringify(orderBody, null, 2));
+
+    const payuResp = await axios.post(`${PAYU_API_URL}/api/v2_1/orders`, orderBody, {
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    // PayU returns redirect URL in redirectUri (sandbox/live may differ)
+    const redirectUrl = payuResp.data?.redirectUri || payuResp.data?.redirectUrl || payuResp.data?.href || null;
+    console.log('DEBUG: PayU response:', JSON.stringify(payuResp.data, null, 2));
+
+    if (!redirectUrl) {
+      console.error('PayU did not return redirect URL:', JSON.stringify(payuResp.data));
+      return res.status(500).send('Payment error: no redirect URL');
+    }
+
+    // Redirect the buyer’s browser to PayU. This is what Ecwid expects.
+    return res.redirect(302, redirectUrl);
+
   } catch (err) {
-    console.error("Error in PayU notification:", err.response?.data || err.message);
-    res.status(500).send("Notify error");
+    // Print the detailed error to logs (PayU response, if any)
+    console.error('Error creating PayU order:', err.response?.data || err.message || err);
+    return res.status(500).send('Payment error');
   }
 });
 
-// ---------- SERVER ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 PayU integration server running on http://localhost:${PORT}`);
+// PayU notification endpoint
+app.post('/notify', async (req, res) => {
+  try {
+    console.log('DEBUG: PayU notify body:', JSON.stringify(req.body, null, 2));
+
+    const payuOrder = req.body?.order || req.body?.transaction || req.body;
+    const extOrderId = payuOrder?.extOrderId || payuOrder?.order?.extOrderId || req.body?.extOrderId;
+    const status = payuOrder?.status || payuOrder?.order?.status;
+
+    if (!extOrderId) {
+      console.error('Notify missing extOrderId:', JSON.stringify(req.body, null, 2));
+      return res.status(400).send('Missing order id');
+    }
+
+    let paymentStatus = 'INCOMPLETE';
+    if (status === 'COMPLETED') paymentStatus = 'PAID';
+    if (status === 'CANCELED' || status === 'REJECTED') paymentStatus = 'CANCELLED';
+
+    // Update Ecwid order payment status
+    await axios.post(
+      `https://app.ecwid.com/api/v3/${ECWID_STORE_ID}/orders/${extOrderId}/payment_status`,
+      { paymentStatus },
+      { headers: { Authorization: `Bearer ${ECWID_API_TOKEN}` } }
+    );
+
+    console.log(`Updated Ecwid order ${extOrderId} => ${paymentStatus}`);
+    res.send('OK');
+  } catch (err) {
+    console.error('Error handling PayU notify:', err.response?.data || err.message || err);
+    res.status(500).send('Notify error');
+  }
 });
+
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
